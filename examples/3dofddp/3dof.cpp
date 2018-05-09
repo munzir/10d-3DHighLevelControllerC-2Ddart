@@ -9,6 +9,9 @@
 #include <ddp/mpc.hpp>
 #include <ddp/util.hpp>
 #include "krangddp.h"
+#include <nlopt.hpp>
+#include <string>
+
 
 using namespace std;
 using namespace dart::common;
@@ -40,6 +43,49 @@ class filter {
     
 };
 
+void constraintFunc(unsigned m, double *result, unsigned n, const double* x, double* grad, void* f_data) {
+
+  OptParams* constParams = reinterpret_cast<OptParams *>(f_data);
+  //std::cout << "done reading optParams " << std::endl;
+
+  if (grad != NULL) {
+    for(int i=0; i<m; i++) {
+      for(int j=0; j<n; j++){
+        grad[i*n+j] = constParams->P(i, j);
+      }
+    }
+  }
+  // std::cout << "done with gradient" << std::endl;
+
+  Eigen::Matrix<double, 30, 1> X;
+  for(size_t i=0; i<n; i++) X(i) = x[i];
+  //std::cout << "done reading x" << std::endl;
+
+  Eigen::VectorXd mResult;
+  mResult = constParams->P*X - constParams->b;
+  for(size_t i=0; i<m; i++) {
+    result[i] = mResult(i);
+  }
+  // std::cout << "done calculating the result"
+}
+
+//========================================================================
+double optFunc(const std::vector<double> &x, std::vector<double> &grad, void *my_func_data) {
+  OptParams* optParams = reinterpret_cast<OptParams *>(my_func_data);
+  //std::cout << "done reading optParams " << std::endl;
+  Eigen::Matrix<double, 30, 1> X(x.data());
+  //std::cout << "done reading x" << std::endl;
+
+  if (!grad.empty()) {
+    Eigen::Matrix<double, 30, 1> mGrad = optParams->P.transpose()*(optParams->P*X - optParams->b);
+    //std::cout << "done calculating gradient" << std::endl;
+    Eigen::VectorXd::Map(&grad[0], mGrad.size()) = mGrad;
+    //std::cout << "done changing gradient cast" << std::endl;
+  }
+  //std::cout << "about to return something" << std::endl;
+  return (0.5 * pow((optParams->P*X - optParams->b).norm(), 2));
+}
+
 class MyWindow : public dart::gui::SimWindow
 {
     using Scalar = double;  
@@ -67,6 +113,8 @@ class MyWindow : public dart::gui::SimWindow
       cFilt = new filter(5, 50);
       R = 0.25;
       L = 0.68;//*6;
+      x0_vel = 0;
+      y0_vel = 0;
       mpc_writer.open_file("mpc_traj.csv");
       computeDDPTrajectory();
 
@@ -216,7 +264,8 @@ class MyWindow : public dart::gui::SimWindow
         
         results_horizon = ddp_horizon.run_horizon(cur_state, hor_control, hor_traj_states, *ddp_dyn, running_cost_horizon, terminal_cost_horizon);
         u = results_horizon.control_trajectory.col(0);
-
+        x0_vel = (ddp_state_traj(6, mpc_steps + 1) - ddp_state_traj(6, mpc_steps)) / 10; // TODO: make the hardcoded ratio into variable
+        y0_vel = (ddp_state_traj(7, mpc_steps + 1) - ddp_state_traj(7, mpc_steps)) / 10; // TODO: make the hardcoded ratio into variable
 
         mpc_writer.save_step(cur_state, u);
 
@@ -243,70 +292,237 @@ class MyWindow : public dart::gui::SimWindow
         tau_R = -0.5*(tau_1-tau_0); */
 
         // *************************************** IDEA 2
+//        double ddth = u(0);
+//        double tau_0 = u(1);
+//
+//        State xdot = ddp_dyn->f(cur_state, u);
+//        double ddx = xdot(3);
+//        double ddpsi = xdot(4);
+//
+//        Eigen::Vector3d ddq, dq;
+//        ddq << ddx, ddpsi, ddth;
+//        dq = cur_state.segment(3,3);
+//        c_forces dy_forces = ddp_dyn->dynamic_forces(cur_state, u);
+//        //double tau_1 = (dy_forces.A.block<1,3>(2,0)*ddq) + (dy_forces.C.block<1,3>(2,0)*dq) + (dy_forces.Q(2)) - (dy_forces.Gamma_fric(2));
+//        double tau_1 = dy_forces.A.block<1,3>(2,0)*ddq;
+//        tau_1 += dy_forces.C.block<1,3>(2,0)*dq;
+//        tau_1 += dy_forces.Q(2);
+//        tau_1 -= dy_forces.Gamma_fric(2);
+//        tau_L = -0.5*(tau_1+tau_0);
+//        tau_R = -0.5*(tau_1-tau_0);
+//
+//        if(abs(tau_L) > 60 | abs(tau_R) > 60){
+//          cout << "step: " << steps << ", tau_0: " << tau_0 << ", tau_1: " << tau_1 << ", tau_L: " << tau_L << ", tau_R: " << tau_R << endl;
+//        }
+
+
+        // ************************************** IDEA 3 QD Approach
+        // State: x, psi, theta, dx, dpsi, dtheta, x0, y0
+
+
+        // **************************** Constraint Jacobian
+        // Constraints:
+        //  0. dZ0 = 0
+        //                                                              => dq_orig(4)*cos(qBody1) + dq_orig(5)*sin(qBody1) = 0
+        //  1. da3 + R/L*(dthL - dthR) = 0
+        //                                                              => dq_orig(1)*cos(qBody1) + dq_orig(2)*sin(qBody1) + R/L*(dq_orig(6) - dq_orig(7)) = 0
+        //  2. da1*cos(psii) + da2*sin(psii) = 0
+        //                                                              => dq_orig(1)*sin(qBody1) - dq_orig(2)*cos(qBody1) = 0
+        //  3. dX0*sin(psii) - dY0*cos(psii) = 0
+        //                                                              => dq_orig(3) = 0
+        //  4. dX0*cos(psii) + dY0*sin(psii) - R/2*(dthL + dthR) = 0
+        //
+        //                                           => dq_orig(4)*sin(qBody1) - dq_orig(5)*cos(qBody1) - R/2*(dq_orig(6) + dq_orig(7) - 2*dq_orig(0)) = 0
+
+        dqFilt = new filter(25, 100);
+        Eigen::VectorXd dqUnFilt = m3DOF->getVelocities();                // n x 1
+        dqFilt->AddSample(dqUnFilt);
+        Eigen::VectorXd dq = dqFilt->average;
+
+        double psi = cur_state(1);
+        double R = 0.265, L = 0.68;
+        double qBody1, dqBody1;
+        Eigen::Matrix<double, 4, 4> baseTf = m3DOF->getBodyNode(0)->getTransform().matrix();
+        qBody1 = atan2(baseTf(0,1)*cos(psi) + baseTf(1,1)*sin(psi), baseTf(2,1));
+        dqBody1 = -dq(0);
+        Eigen::MatrixXd J = Eigen::MatrixXd::Zero(5, 8);
+        J(0,4) = cos(qBody1); J(0,5) = sin(qBody1);
+        J(1,1) = cos(qBody1); J(1,2) = sin(qBody1); J(1,6) = R/L; J(1,7) = -R/L;
+        J(2,1) = sin(qBody1); J(2,2) = -cos(qBody1);
+        J(3,3) = 1;
+        J(4,0) = R; J(4,4) = sin(qBody1); J(4,5) = -cos(qBody1); J(4,6) = -R/2; J(4,7) = -R/2;
+
+        // Initialize
         double ddth = u(0);
         double tau_0 = u(1);
         State xdot = ddp_dyn->f(cur_state, u);
-        double ddx = xdot(3);
-        double ddpsi = xdot(4);
-        Eigen::Vector3d ddq, dq;
-        ddq << ddx, ddpsi, ddth;
-        dq = cur_state.segment(3,3);
-        c_forces dy_forces = ddp_dyn->dynamic_forces(cur_state, u);
-        //double tau_1 = (dy_forces.A.block<1,3>(2,0)*ddq) + (dy_forces.C.block<1,3>(2,0)*dq) + (dy_forces.Q(2)) - (dy_forces.Gamma_fric(2));
-        double tau_1 = dy_forces.A.block<1,3>(2,0)*ddq;
-        tau_1 += dy_forces.C.block<1,3>(2,0)*dq;
-        tau_1 += dy_forces.Q(2);
-        tau_1 -= dy_forces.Gamma_fric(2);
-        tau_L = -0.5*(tau_1+tau_0);
-        tau_R = -0.5*(tau_1-tau_0);
+        State xref = cur_state + xdot * 0.001; //TODO: Pull DT from model and not hard code
+        double Kptheta = 15.0, Kvtheta = 2.0;
+        double Kppsi = 15.0, Kvpsi = 2.0;
+        double Kpx0 = 15.0, Kvx0 = 2.0;
+        double Kpy0 = 15.0, Kvy0 = 2.0;
+        double wpsi = 1.0;
+        double wtheta = 1.0;
+        double wx0 = 1.0;
+        double wy0 = 1.0;
 
-        if(abs(tau_L) > 60 | abs(tau_R) > 60){
-          cout << "step: " << steps << ", tau_0: " << tau_0 << ", tau_1: " << tau_1 << ", tau_L: " << tau_L << ", tau_R: " << tau_R << endl;
-        }
+        // BALANCE TASK (THETA)
+        // theta, dehta, ddtheta
+        double theta_ref =  xref(2);
+        double theta = cur_state(2);
+        double dtheta = cur_state(5);
+        double dtheta_ref = xref(5);
+        double ddtheta_ref = ddth - Kvtheta * (dtheta - dtheta_ref) - Kptheta * (theta - theta_ref);
+
+
+        // Jacobian and dJacobian
+        Eigen::Matrix<double, 1, 8> zero8rows;
+        zero8rows = Eigen::MatrixXd::Zero(1, 8);
+        double JTheta = -1;
+        Eigen::Matrix<double, 1, 8> Ptheta;
+        Ptheta << wtheta*JTheta, 0, 0, 0, 0, 0, 0, 0;
+        Eigen::Matrix<double, 1, 8> dJtheta;
+        dJtheta = zero8rows;
+        Eigen::Matrix<double, 1, 1> btheta;
+        btheta << wtheta * (ddtheta_ref);
+
+
+        // PSI TASK
+        // psi, dpsi, ddpsi
+        double ddpsi = 0;
+        double psi_ref = xref(1);
+        psi = cur_state(1);
+        double dpsi = cur_state(4);
+        double dpsi_ref = xref(4);
+        double ddpsi_ref = ddpsi - Kvpsi * (dpsi - dpsi_ref) - Kppsi * (psi - psi_ref);
+
+        // Jacobian and dJacobian
+        Eigen::Matrix<double, 1, 8> Jpsi;
+        Jpsi << 0, cos(qBody1), sin(qBody1), 0, 0, 0, 0, 0;
+        Eigen::Matrix<double, 1, 8> dJpsi;
+        dJpsi << 0,-sin(qBody1)*dqBody1, cos(qBody1)*dqBody1, 0, 0, 0, 0, 0;
+
+        Eigen::Matrix<double, 1, 8> Ppsi;
+        Ppsi << wpsi * Jpsi, 0, 0, 0, 0, 0;
+        Eigen::Matrix<double, 1, 1> bpsi;
+        bpsi << wpsi * (-dJpsi*dq + ddpsi_ref);
+
+
+        // X0 TASK
+        double ddx0 = 0;
+        double x0_ref = xref(6);
+        double x0 = cur_state(6);
+        double dx0 = 0;
+        double dx0_ref = 0;
+        double ddx0_ref = ddx0 - Kvx0 * (dx0 - dx0_ref) - Kpx0 * (x0 - x0_ref);
+
+        Eigen::Matrix<double, 1, 8> Jx;
+        Eigen::Matrix<double, 1, 8> dJx;
+        Eigen::Matrix<double, 1, 8> Px;
+        Eigen::Matrix<double, 1, 1> bx;
+        Jx << 0, 0, 0, sin(psi), sin(qBody1) * cos(psi), -cos(qBody1) * cos(psi), 0, 0;
+        dJx << 0, 0, 0, cos(psi), cos(qBody1) * cos(psi) - sin(qBody1) * sin(psi), sin(qBody1) * cos(psi) + cos(qBody1) * sin(psi), 0, 0;
+        Px << wx * Jx;
+        bx << wx * ( -dJx * dq + ddx_ref);
+
+
+        // Y0 TASK
+        double ddy = 0;
+        double y_ref = xref(7);
+        double y = cur_state(7);
+        double dy = 0;
+        double dy_ref = 0;
+        double ddy_ref = ddy - Kvy * (dy - dy_ref) - Kpy * (y - y_ref);
+
+        Eigen::Matrix<double, 1, 8> Jy;
+        Eigen::Matrix<double, 1, 8> dJy;
+        Eigen::Matrix<double, 1, 8> Py;
+        Eigen::Matrix<double, 1, 1> by;
+        Jy << 0, 0, 0, -cos(psi), sin(qBody1) * sin(psi), -cos(qBody1) * sin(psi), 0, 0;
+        dJy << 0, 0, 0, sin(psi), cos(qBody1) * sin(psi) + sin(qBody1) * cos(psi), sin(qBody1) * sin(psi) - cos(qBody1) * cos(psi), 0, 0;
+        Py << wy * Jy;
+        by << wy * ( -dJy * dq + ddy_ref);
+
+        Eigen::MatrixXd M = m3DOF->getMassMatrix();
+        Eigen::VectorXd h = m3DOF->getCoriolisAndGravityForces();
+
+        Eigen::MatrixXd P(Ppsi.rows() + Ptheta.rows() + Px.rows() + Py.rows(), Ppsi.cols());
+        P << Ppsi, Ptheta, Px, Py;
+
+        Eigen::MatrixXd b(bpsi.rows() + btheta.rows() + bx.rows() + by.rows(), bpsi.cols());
+        b << bpsi, btheta, bx, by;
+
+        //*******************************Torque Limits
+        Eigen::Matrix<double, 19, 1> T_ub;
+        Eigen::Matrix<double, 19, 1> T_lb;
+        T_ub << 60, 60, 740, 370, 10, 370, 370, 175, 175, 40, 40, 9.5, 370, 370, 175, 175, 40, 40, 9.5;
+        T_lb << -T_ub;
+
+        OptParams optParams;
+        optParams.P = P;
+        optParams.b = b;
+
+        OptParams constraintParams[2];
+        Eigen::Matrix<double, 6, 30> P_;
+        Eigen::Matrix<double, 6, 1> b_;
+        P_ << M.block<6,25>(0, 0), (-J.block<5, 6>(0, 0).transpose());
+        b_ << -h.head(6);
+        constraintParams[0].P = P_;
+        constraintParams[0].b = b_;
+        constraintParams[1].P = -P_;
+        constraintParams[1].b = -b_;
+
+        OptParams inequalityconstraintParams[2];
+        Eigen::Matrix<double, 19, 30> P1_;
+        Eigen::Matrix<double, 19, 30> P2_;
+        Eigen::Matrix<double, 19, 1> b1_;
+        Eigen::Matrix<double, 19, 1> b2_;
+        P1_ << M.block<19, 25>(6,0), -J.block<5, 19>(0,6).transpose();
+        P2_ << -M.block<19, 25>(6,0), J.block<5, 19>(0,6).transpose();
+        b1_ << -h.tail(19) + T_ub;
+        b2_ << h.tail(19) - T_lb;
+
+        const vector<double> constraintTol(6, 1e-3);
+        const vector<double> lb(30, -10);
+        const vector<double> ub(30, 10);
+
+        const vector<double> inequalityconstraintTol(19, 1e-3);
+        inequalityconstraintParams[0].P = P1_;
+        inequalityconstraintParams[0].b = b1_;
+        inequalityconstraintParams[1].P = P2_;
+        inequalityconstraintParams[1].b = b2_;
+
+
+        // Initialize Optimizer
+        nlopt::opt opt(nlopt::LD_SLSQP, 30);
+        opt.set_xtol_rel(1e-3);
+        int maxtimeSet = 0;
+
+
+        double minf;
+        opt.set_min_objective(optFunc, &optParams);
+        opt.add_inequality_mconstraint(constraintFunc, &inequalityconstraintParams[0], inequalityconstraintTol);
+        opt.add_inequality_mconstraint(constraintFunc, &inequalityconstraintParams[1], inequalityconstraintTol);
+        opt.add_equality_mconstraint(constraintFunc, &constraintParams[1], constraintTol);
+        //opt.set_lower_bounds(lb);
+        //opt.set_upper_bounds(ub);
+        opt.set_xtol_rel(1e-3);
+        int maxtimeSet = 0;
+
+        vector<double> ddq_lambda_vec(13);
+        Eigen::VectorXd::Map(&ddq_lambda_vec[0], ddq_lambda.size()) = ddq_lambda;
+        opt.optimize(ddq_lambda_vec, minf);
+        mForces << (M.block<8, 8>(0, 6)*ddq_lambda.head(8) + h.tail(8) - (J.block<5, 8>(0,6).transpose())*ddq_lambda.tail(5));
+
       }
       mForces << 0, 0, 0, 0, 0, 0, tau_L, tau_R;
       m3DOF->setForces(mForces);
 
-      
-      // Constraints
-      // 1. dZ0 = 0                                               => dq_orig(4)*cos(qBody1) + dq_orig(5)*sin(qBody1) = 0
-      // 2. da3 + R/L*(dthL - dthR) = 0                           => dq_orig(1)*cos(qBody1) + dq_orig(2)*sin(qBody1) + R/L*(dq_orig(6) - dq_orig(7)) = 0 
-      // 3. da1*cos(psii) + da2*sin(psii) = 0                     => dq_orig(1)*sin(qBody1) - dq_orig(2)*cos(qBody1) = 0
-      // 4. dX0*sin(psii) - dY0*cos(psii) = 0                     => dq_orig(3) = 0
-      // 5. dX0*cos(psii) + dY0*sin(psii) - R/2*(dthL + dthR) = 0 => dq_orig(4)*sin(qBody1) - dq_orig(5)*cos(qBody1) - R/2*(dq_orig(6) + dq_orig(7) - 2*dq_orig(0)) = 0
-      // Eigen::Matrix<double, 5, 1> c;
-      // c << (dq_orig(4)*cos(qBody1) + dq_orig(5)*sin(qBody1)), (dq_orig(1)*cos(qBody1) + dq_orig(2)*sin(qBody1) + R/L*(dq_orig(6) - dq_orig(7))), (dq_orig(1)*sin(qBody1) - dq_orig(2)*cos(qBody1)), dq_orig(3), (dq_orig(4)*sin(qBody1) - dq_orig(5)*cos(qBody1) - R/2*(dq_orig(6) + dq_orig(7) - 2*dq_orig(0)));
-      // cFilt->AddSample(c);
-      // //if(Tf(2,1) > 0)
-      // {
-      // for(int i=0; i<8; i++) outFile << dq(i) << ", ";
-      // for(int i=0; i<8; i++) outFile << dqFilt->average(i) << ", ";
-      // outFile << psi << ", " << dpsi << ", " << qBody1 << ", " << dqBody1 << ", " <<  dthL << ", " << dthR << ", ";
-      // outFile << psiFilt << ", " << dpsiFilt << ", " << qBody1Filt << ", " << dqBody1Filt << ", " <<  dthLFilt << ", " << dthRFilt << ", ";
-      // for(int i=0; i<5; i++) outFile << c(i) << ", ";
-      // for(int i=0; i<5; i++) outFile << cFilt->average(i) << ", ";
-      // for(int i=0; i<8; i++) outFile << q(i) << ", "; 
-      // outFile << std::endl;
-      // }
-      
-      // arbitrary control inputs
-      // steps++;
-      // double headSign = (cos(2*3.14/80*steps*0.01) > 0) ? 1 : -1;
-      // double spinSign = (sin(2*3.14/20*steps*0.01) > 0) ? 1 : -1;
-      // double uL = ((steps < 1000) ? 0 : 5*headSign-5*spinSign);
-      // double uR = ((steps < 1000) ? 0 : 5*headSign+5*spinSign);
-      /*double head = cos(2*3.14/10*steps*0.01);
-      double spin = ( (sin(2*3.14/40*steps*0.01)>0) ? -1 : 1 );
-      double uL = ((steps < 1000) ? 0 : 60*head-200*spin);
-      double uR = ((steps < 1000) ? 0 : 60*head+200*spin);*/
 
-      // int beginStep = 500;
-      // double thWheelRef = 0;//2*sin(2*M_PI*(steps-beginStep)*0.001/20);
-      // double dthWheelRef = 0;//0.1;
-      // double u = ((steps>beginStep)?(250*(qBody1 - 0) + 40*(dqBody1Filt - 0) + 1*((thL + thR)/2 - thWheelRef) + 10*((dthLFilt+dthRFilt)/2 - dthWheelRef)):0);
-      // mForces << 0, 0, 0, 0, 0, 0, u, u;
-      // m3DOF->setForces(mForces);
-      
+
+
+
+
       SimWindow::timeStepping();
     }
 
@@ -365,6 +581,7 @@ class MyWindow : public dart::gui::SimWindow
     StateTrajectory ddp_state_traj;
     Dynamics *ddp_dyn;
     Control u;
+    double x0_vel, y0_vel;
     CSV_writer<Scalar> mpc_writer;
 
 };
